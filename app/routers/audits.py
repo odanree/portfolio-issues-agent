@@ -15,8 +15,8 @@ from fastapi import APIRouter
 
 from app.agent.graph import start_workflow
 from app.config import get_settings
+from app.db import session as db_session
 from app.db.repository import IssueProposalRepository
-from app.db.session import AsyncSessionLocal
 
 log = structlog.get_logger()
 router = APIRouter()
@@ -54,8 +54,12 @@ async def _process_one(payload: dict[str, Any]) -> dict:
         )
         return {"run_id": run_id, "status": "skipped"}
 
-    if AsyncSessionLocal is not None:
-        async with AsyncSessionLocal() as session:
+    # Re-read AsyncSessionLocal at call time — init_db sets it on the
+    # app.db.session module after startup, so importing the name at module
+    # load would freeze it as None.
+    session_factory = db_session.AsyncSessionLocal
+    if session_factory is not None:
+        async with session_factory() as session:
             repo = IssueProposalRepository(session)
             existing_open = await repo.list_open_proposals_for_project(payload["project_id"])
             if existing_open:
