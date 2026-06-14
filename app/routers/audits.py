@@ -23,12 +23,42 @@ router = APIRouter()
 
 
 async def _process_one(payload: dict[str, Any]) -> dict:
-    """Persist a pending row, then drive the graph to its interrupt."""
+    """Drive the graph to its interrupt point, persisting a pending row.
+
+    Order matters:
+      1. Pre-flight DB dedup BEFORE start_workflow so a re-run doesn't double-
+         post Slack proposals while the original is still pending approval.
+      2. start_workflow runs classify → draft → notify_slack → interrupt.
+      3. If classify decided skip, no DB row is written.
+      4. Otherwise, persist as pending so the next audit dedups against it.
+    """
+    project_id = payload["project_id"]
+    project_name = payload["project_name"]
+
+    # Re-read AsyncSessionLocal at call time — init_db sets it on the
+    # app.db.session module after startup, so importing the name at module
+    # load would freeze it as None.
+    session_factory = db_session.AsyncSessionLocal
+
+    # (1) Pre-flight dedup
+    if session_factory is not None:
+        async with session_factory() as session:
+            repo = IssueProposalRepository(session)
+            existing_open = await repo.list_open_proposals_for_project(project_id)
+            if existing_open:
+                log.info(
+                    "audit_skip_existing_open_proposal",
+                    project=project_name,
+                    open_run_ids=[p.run_id for p in existing_open],
+                )
+                return {"status": "skipped_existing", "open_run_ids": [p.run_id for p in existing_open]}
+
+    # (2) Run graph to interrupt
     run_id = str(uuid.uuid4())
     initial_state = {
         "run_id": run_id,
-        "project_id": payload["project_id"],
-        "project_name": payload["project_name"],
+        "project_id": project_id,
+        "project_name": project_name,
         "repo_owner": payload["repo_owner"],
         "repo_name": payload["repo_name"],
         "report": payload["report"],
@@ -37,7 +67,6 @@ async def _process_one(payload: dict[str, Any]) -> dict:
     }
     await start_workflow(initial_state)
 
-    # Persist after the graph has drafted; pull current state to capture draft fields
     from app.agent.graph import get_current_state
     current = await get_current_state(run_id) or {}
     title = current.get("proposed_title") or "(empty)"
@@ -45,34 +74,24 @@ async def _process_one(payload: dict[str, Any]) -> dict:
     labels = current.get("proposed_labels") or []
     classification = current.get("classification")
 
+    # (3) classify said skip → no DB row, no Slack message
     if classification == "skip":
         log.info(
             "audit_skipped_project",
             run_id=run_id,
-            project=payload["project_name"],
+            project=project_name,
             reason=current.get("skip_reason"),
         )
         return {"run_id": run_id, "status": "skipped"}
 
-    # Re-read AsyncSessionLocal at call time — init_db sets it on the
-    # app.db.session module after startup, so importing the name at module
-    # load would freeze it as None.
-    session_factory = db_session.AsyncSessionLocal
+    # (4) Persist as pending
     if session_factory is not None:
         async with session_factory() as session:
             repo = IssueProposalRepository(session)
-            existing_open = await repo.list_open_proposals_for_project(payload["project_id"])
-            if existing_open:
-                log.info(
-                    "audit_skip_existing_open_proposal",
-                    project=payload["project_name"],
-                    open_run_ids=[p.run_id for p in existing_open],
-                )
-                return {"run_id": run_id, "status": "skipped_existing"}
             await repo.create_pending(
                 run_id=run_id,
-                project_id=payload["project_id"],
-                project_name=payload["project_name"],
+                project_id=project_id,
+                project_name=project_name,
                 repo_owner=payload["repo_owner"],
                 repo_name=payload["repo_name"],
                 proposed_title=title,

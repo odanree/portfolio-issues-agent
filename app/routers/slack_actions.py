@@ -16,6 +16,8 @@ from fastapi import APIRouter, HTTPException, Request, Response
 
 from app.agent.graph import resume_workflow
 from app.config import get_settings
+from app.db import session as db_session
+from app.db.repository import IssueProposalRepository
 from app.services.slack_client import verify_signature
 
 log = structlog.get_logger()
@@ -80,8 +82,42 @@ async def handle_slack_action(request: Request) -> Response:
 
 
 async def _resume_and_log(run_id: str, approved: bool, reviewer_id: str) -> None:
+    """Drive the graph past the interrupt, then transition the DB row.
+
+    Status path:
+      pending → rejected                       (reject button)
+      pending → approved → created             (approve → GitHub issue opened)
+      pending → approved → failed              (approve → GitHub call errored)
+    The dedup query in audits._process_one only considers pending+approved as
+    open, so once we reach created/rejected/failed the project is eligible for
+    a fresh proposal on the next audit.
+    """
     try:
-        await resume_workflow(run_id, approved=approved, reviewer_id=reviewer_id)
+        final = await resume_workflow(run_id, approved=approved, reviewer_id=reviewer_id)
         log.info("slack_action_workflow_resumed", run_id=run_id, approved=approved)
     except Exception as e:
         log.error("slack_action_resume_failed", run_id=run_id, error=str(e))
+        return
+
+    # Resolve the DB row. Skipped silently if the DB layer wasn't initialized
+    # (which happens in tests where the audit was never persisted).
+    session_factory = db_session.AsyncSessionLocal
+    if session_factory is None:
+        return
+    try:
+        async with session_factory() as session:
+            repo = IssueProposalRepository(session)
+            await repo.mark_decided(run_id, approved=approved, reviewer_slack_id=reviewer_id)
+            if not approved:
+                return
+            issue_url = final.get("issue_url") if isinstance(final, dict) else None
+            issue_number = final.get("issue_number") if isinstance(final, dict) else None
+            error = final.get("error") if isinstance(final, dict) else None
+            if issue_url and issue_number:
+                await repo.mark_created(
+                    run_id, issue_url=issue_url, issue_number=int(issue_number)
+                )
+            elif error:
+                await repo.mark_failed(run_id, error=str(error))
+    except Exception as e:
+        log.error("slack_action_db_update_failed", run_id=run_id, error=str(e))
