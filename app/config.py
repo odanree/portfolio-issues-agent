@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     audit_cron_day_of_week: str = "sun"
     audit_cron_hour: int = 9
 
+    # Cap proposals per audit so a many-project portfolio doesn't flood Slack.
+    # Findings are ranked by drift density (number of substantive change types)
+    # and only the top N are surfaced. 0 = no cap.
+    max_proposals_per_run: int = 5
+
     # App
     app_env: str = "development"
     log_level: str = "INFO"

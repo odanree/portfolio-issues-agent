@@ -101,6 +101,27 @@ async def _process_one(payload: dict[str, Any]) -> dict:
     return {"run_id": run_id, "status": "pending_approval"}
 
 
+def _drift_density(payload: dict[str, Any]) -> int:
+    """Cheap signal for ranking findings. Higher = more substantive drift.
+
+    Each of description/outcome rewrites counts 1; each tech addition/removal
+    counts 1; a stale repo gets a 2-point boost. The actual numbers don't
+    matter much — we only need a stable sort so the cap drops the lowest-signal
+    rows rather than arbitrary ones.
+    """
+    report = payload.get("report") or {}
+    score = 0
+    if report.get("description_suggestion"):
+        score += 1
+    if report.get("outcome_suggestion"):
+        score += 1
+    score += len(report.get("tech_stack_additions") or [])
+    score += len(report.get("tech_stack_removals") or [])
+    if report.get("is_stale"):
+        score += 2
+    return score
+
+
 async def run_weekly_audit() -> dict:
     """Pull drift findings from the upstream analyzer and kick a workflow per finding."""
     settings = get_settings()
@@ -109,10 +130,23 @@ async def run_weekly_audit() -> dict:
     # Run it in a thread so we don't block the event loop.
     from app.services.drift import audit_portfolio
 
-    loop_results = []
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(lambda: list(audit_portfolio(model=settings.agent_model)))
         findings = future.result()
+
+    total = len(findings)
+    capped_off = 0
+    if settings.max_proposals_per_run > 0 and total > settings.max_proposals_per_run:
+        findings = sorted(findings, key=_drift_density, reverse=True)
+        findings = findings[: settings.max_proposals_per_run]
+        capped_off = total - len(findings)
+        log.info(
+            "audit_findings_capped",
+            total_found=total,
+            kept=len(findings),
+            dropped=capped_off,
+            cap=settings.max_proposals_per_run,
+        )
 
     log.info("audit_findings_collected", count=len(findings))
 
@@ -126,7 +160,12 @@ async def run_weekly_audit() -> dict:
                 "audit_process_one_failed", project=payload["project_name"], error=str(e)
             )
             processed.append({"project": payload["project_name"], "status": "error", "error": str(e)})
-    return {"total": len(findings), "results": processed}
+    return {
+        "total_found": total,
+        "processed": len(processed),
+        "dropped_by_cap": capped_off,
+        "results": processed,
+    }
 
 
 @router.post("/api/audits/run")
