@@ -6,12 +6,13 @@ Two entry points:
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import structlog
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 
 from app.agent.graph import start_workflow
 from app.config import get_settings
@@ -168,6 +169,34 @@ async def run_weekly_audit() -> dict:
     }
 
 
-@router.post("/api/audits/run")
-async def trigger_audit() -> dict:
-    return await run_weekly_audit()
+async def _run_and_log(job_id: str) -> None:
+    """Run the audit and log the result with the job_id for correlation."""
+    try:
+        result = await run_weekly_audit()
+        log.info(
+            "audit_completed",
+            job_id=job_id,
+            total_found=result["total_found"],
+            processed=result["processed"],
+            dropped_by_cap=result["dropped_by_cap"],
+        )
+    except Exception as e:
+        log.exception("audit_failed", job_id=job_id, error=str(e))
+
+
+@router.post("/api/audits/run", status_code=202)
+async def trigger_audit(response: Response) -> dict:
+    """Fire-and-forget. Returns 202 immediately; the audit runs in the
+    background and surfaces progress through structured logs and Slack
+    messages. Grep logs by job_id to find the result.
+
+    The synchronous variant lived here before but on a 22-project portfolio
+    the response could exceed 60s — Cloudflare's edge timeout — so callers
+    saw 524s even though the work completed. The agent is also the only
+    consumer of its own result; nothing reads the response body.
+    """
+    job_id = str(uuid.uuid4())
+    log.info("audit_started", job_id=job_id)
+    asyncio.create_task(_run_and_log(job_id))
+    response.headers["Location"] = f"/api/audits/{job_id}"
+    return {"job_id": job_id, "status": "started"}
