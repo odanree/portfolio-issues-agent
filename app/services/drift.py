@@ -74,5 +74,17 @@ def audit_portfolio(model: str) -> Iterator[dict]:
             "project_name": project.name,
             "repo_owner": owner,
             "repo_name": repo,
-            "report": asdict(report),
+            "report": serialize_report(report),
         }
+
+
+def serialize_report(report) -> dict:
+    """Convert a DriftReport to a dict the graph state can hold.
+
+    asdict() drops @property fields, but the graph's classify node keys off
+    report["has_changes"] — so we add it explicitly. Pulled out of
+    audit_portfolio so it can be unit-tested without the upstream stack.
+    """
+    out = asdict(report)
+    out["has_changes"] = report.has_changes
+    return out
